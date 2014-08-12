@@ -3,26 +3,22 @@ path          = require "path"
 util          = require "util"
 async         = require "async"
 CoffeeScript  = require "coffee-script"
+gaze          = require "gaze"
 glob          = require "glob"
 minimatch     = require "minimatch"
-fsWatchTree   = require "fs-watch-tree"
 nStore        = require "nstore"
 growl         = require "growl"
 compilers     = require "./compilers"
+optparse      = require "./optparse"
 _             = require "underscore"
-_.mixin(require("underscore.string"))
 
-# load cake opt parser from CoffeeScript
-rootDir = path.normalize(path.join(path.dirname(fs.realpathSync(__filename)), "../.."))
-optparse = require path.join(rootDir, "node_modules/coffee-script/lib/coffee-script/optparse.js")
-
-
+_cwd = process.cwd()
 _switches = []
 _tasks = {}
 _mappings = []
+_mappingsWatcher = null
 _db = null
-_watch = null
-
+_runQueue = null
 
 # the entry point (called from bin/pie)
 exports.run = () ->
@@ -59,13 +55,12 @@ load = (cb) ->
   task "watch", "Run a build, then start watching the filesystem for changes, triggering mappings as necessary", (options, cb) ->
     invoke "build", options, (err) ->
       return cb(err) if err
-      startWatcher(options, cb)
+      watchMappings(options, cb)
 
   # slurp up the Piefile (can override the default tasks if it wants)
   evaluatePiefile (err) ->
     return cb(err) if err
-    nStoreAlreadyFiredCallback = false
-    _db = nStore.new(".pie.db", ((err) -> if !nStoreAlreadyFiredCallback then nStoreAlreadyFiredCallback = true; cb(err)))
+    reloadDB(cb)
 
 evaluatePiefile = (cb) ->
   fs.readFile "Piefile", (err, code) ->
@@ -97,9 +92,19 @@ map = (name, args...) ->
   _mappings.push(m)
   task name, "Run #{name}", (options, cb) -> m.run(options, cb)
 
-defineDefaultTasks = () ->
+watch = (paths, eventHandler, cb = noop) ->
+  w = new Watcher(paths, eventHandler)
+  w.start (err) -> cb(err, w)
 
-_.extend(global, { option: option, task: task, invoke: invoke, map: map, compilers: compilers })
+reloadDB = (cb) ->
+  nStoreAlreadyFiredCallback = false
+  _db = nStore.new ".pie.db", (err) ->
+    if !nStoreAlreadyFiredCallback
+      nStoreAlreadyFiredCallback = true
+      cb(err)
+
+# exports, available in global namespace of Piefile
+_.extend(global, { option: option, task: task, invoke: invoke, map: map, compilers: compilers, watch: watch, reloadDB: reloadDB })
 
 getMtime = (file, cb) ->
   fs.stat file, (err, stats) ->
@@ -109,9 +114,9 @@ getMtime = (file, cb) ->
 printErr = (err) ->
   if err
     if err.stack?
-      console.log(err.stack)
+      console.log red(err.stack)
     else
-      console.log(shortErr(err))
+      console.log red(shortErr(err))
 
 shortErr = (err) ->
   if err.message?
@@ -122,40 +127,53 @@ shortErr = (err) ->
 runAllMappings = (options, cb) ->
   async.forEachSeries _mappings, ((m, innerCb) -> m.run(options, innerCb)), (err) ->
     return cb(err) if err
-    console.log "Build complete"
+    console.log green("Build complete")
     growl "Build complete"
     cb(null)
 
-cleanAllMappings = (options, cb) ->
-  rm = (f, innerCb) ->
-    try
-      fs.unlink f, (err) ->
-        console.log(f, err) if err && err.code != "ENOENT"
-        innerCb(null)
-    catch err
-      console.log(f, err) if err && err.code != "ENOENT"
+rm = (f, innerCb) ->
+  console.log "Deleting #{f}"
+  try
+    fs.unlink f, (err) ->
+      console.log red("#{f}: #{err}") if err && err.code != "ENOENT"
       innerCb(null)
+  catch err
+    console.log red("#{f}: #{err}") if err && err.code != "ENOENT"
+    innerCb(null)
 
-  async.map _mappings, ((m, innerCb) -> m.outputFiles(innerCb)), (err, files) ->
+cleanAllMappings = (options, cb) ->
+  async.map _mappings, ((m, innerCb) -> m.clean(innerCb)), (err) ->
     return cb(err) if err
-    files.push ".pie.db"
-    async.forEach _.uniq(_.flatten(files)), rm, cb
+    rm ".pie.db", cb
 
-startWatcher = (options, cb) ->
+watchMappings = (options, cb) ->
+  _mappingsWatcher.stop() if _mappingsWatcher
+
+  # calculate watch targets
+  toWatch = _.uniq(_.flatten(_.map(_mappings, (m) -> m.src)))
+
   console.log "Starting watcher"
-  _watch = fsWatchTree.watchTree ".",
-                                 { exclude: [".git", ".pie.db", "node_modules", "log", "tmp"] },
-                                 watchEvent
-  cb(null)
+  _mappingsWatcher = watch(toWatch, handleMappingWatchEvent, cb)
 
-stopWatcher = () ->
-  _watch.end()
+handleMappingWatchEvent = (event, path) ->
+  console.log "#{path} was #{event}"
+  mappings = _.filter(_mappings, (m) -> m.matchesSrc(path))
 
-watchEvent = (event) ->
-  unless event.isDelete()
-    console.log event.name, "changed"
-    mappings = _.filter(_mappings, (m) -> m.matchesSrc(event.name))
-    async.forEach mappings, ((m) -> m.runOnFiles([event.name], {}, printErr)), printErr
+  async.forEach mappings, (m, cb) ->
+    unless event is "deleted" and !m.batch
+      # run mapping on non-deletes, or if it's a deleted file in a batch mapping
+      _runQueue.add(m, [path])
+      cb()
+    else
+      # on a delete in non-batched mapping, delete the output file(s)
+      m.cleanForFiles([path], cb)
+  , printErr
+
+noop = () -> null
+
+red    = (str) -> "\x1B[0;31m#{str}\x1B[0m"
+green  = (str) -> "\x1B[0;32m#{str}\x1B[0m"
+yellow = (str) -> "\x1B[0;33m#{str}\x1B[0m"
 
 
 # just a lil' bit o' code
@@ -181,13 +199,17 @@ class Mapping
     else if args.length == 2
       @func = args[1]
       @options = args[0]
+    @batch = @options.batch
 
-  updateMtime: (file, cb) ->
+  updateMtime: (file, cb) =>
     getMtime file, (err, mtime) =>
       return cb(err) if err
       _db.save("#{@name}:#{file}", mtime, cb)
 
-  hasChanged: (file, cb) ->
+  clearMtime: (file, cb) =>
+    _db.save("#{@name}:#{file}", null, cb)
+
+  hasChanged: (file, cb) =>
     _db.get "#{@name}:#{file}", (err, prev) ->
       if !err && prev
         getMtime file, (err, mtime) ->
@@ -204,7 +226,7 @@ class Mapping
     else
       cb("mapping src must be string or array of strings")
 
-  calculateDest: (f) ->
+  calculateDest: (f) =>
     if _.isFunction(@dest)
       @dest(f)
     else
@@ -213,7 +235,7 @@ class Mapping
   outputFiles: (cb) ->
     @findSrcFiles (err, files) =>
       return cb(err) if err
-      cb(null, _.uniq(_.flatten(_.map(files, _.bind(@calculateDest, @)))))
+      cb(null, _.uniq(_.flatten(_.map(files, @calculateDest))))
 
   matchesSrc: (file) ->
     if _.isString(@src)
@@ -229,16 +251,16 @@ class Mapping
       @runOnFiles(files, options, cb)
 
   runOnFiles: (files, options, cb) ->
-    console.log "Running", @name, "on", files.length, "files"
-    async.filter files, _.bind(@hasChanged, @), (changedFiles) =>
+    console.log green("Running #{@name} on #{files.length} files")
+    async.filter files, @hasChanged, (changedFiles) =>
       unchangedFiles = _.without(files, changedFiles)
 
-      if @options.batch
+      if @batch
         if changedFiles.length > 0
           @execFunc changedFiles, options, (err) =>
             growl("#{@name}\n#{shortErr(err)}") if err
             return cb(err) if err
-            async.forEach changedFiles, _.bind(@updateMtime, @), cb
+            async.forEach changedFiles, @updateMtime, cb
         else
           cb(null)
       else
@@ -257,3 +279,59 @@ class Mapping
       @func(f, @calculateDest(f), options, cb)
     catch err
       cb(err)
+
+  clean: (cb) ->
+    @findSrcFiles (err, files) =>
+      return cb(err) if err
+      @cleanForFiles(files, cb)
+
+  cleanForFiles: (srcFiles, cb) ->
+    async.forEach srcFiles, @clearMtime, (err) =>
+      return cb(err) if err
+      destFiles = _.uniq(_.flatten(_.map(srcFiles, @calculateDest)))
+      async.forEach destFiles, rm, cb
+
+
+# queue up tasks and run one at a time
+class RunQueue
+  constructor: () ->
+    @running = false
+    @queue   = []
+
+  add: (mapping, paths) ->
+    if found = _.find(@queue, (e) -> e[0] is mapping)
+      found[1] = _.uniq(found[1].concat(paths))
+    else
+      @queue.push([mapping, paths])
+
+    unless @running
+      clearTimeout(@startRunTimer) if @startRunTimer
+      @startRunTimer = setTimeout(@run, 50)
+
+  run: () =>
+    clearTimeout(@startRunTimer) if @startRunTimer
+    if @queue.length > 0
+      @running = true
+      [m, paths] = @queue.shift()
+      m.runOnFiles(paths, {}, @run)
+    else
+      @running = false
+
+_runQueue = new RunQueue()
+
+
+# watch one or more files or directory trees, and call eventHandler if anything
+# changes (or is added or removed)
+class Watcher
+  constructor: (@paths, @eventHandler) ->
+    @watcher = null
+
+  start: (cb = noop) ->
+    gaze @paths, { interval: 250 }, (err, @watcher) =>
+      @watcher.on "all", (event, filepath) =>
+        filepath = filepath.replace("#{_cwd}\/", "")
+        @eventHandler(event, filepath)
+
+  stop: (cb = noop) ->
+    @watcher?.close()
+    cb(null)

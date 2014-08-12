@@ -1,7 +1,40 @@
+== 0.2.1 / 2013-04-18
+  * Minor enhancements
+    * Turned down interval for file polling to be friendlier to CPU.
+== 0.2.0 / 2013-04-17
+  * Major enhancements
+    * Watch triggers are much more stable.
+  * API changes
+    * Watch now takes three arguments instead of four: watch(paths, eventHandler, callback).
+== 0.1.7 / 2013-04-17
+  * Minor enhancements
+    * Added color to output.
+== 0.1.6 / 2012-12-20
+  * Minor enhancements
+    * Commands running due to changed files are now run in serial (and commands are combined where possible).
+    * Switched to patched version of fs-watch-tree.
+== 0.1.5 / 2012-10-04
+  * Minor Enhancements
+    * Generated files are now deleted when source files are removed or renamed.
+    * Batch operations are re-run when when source files are removed or renamed.
+  * Bug Fixes
+    * Fixed issue where directories with pieces of their paths in common would result in only one being watched.
+== 0.1.4 / 2012-10-04
+  * Minor Enhancements
+    * Added watch function to Piefile so it can be used for custom watch functionality.
+== 0.1.3 / 2012-10-01
+  * Minor Enhancements
+    * Watch now ignores autosave files from common editors.
+== 0.1.2 / 2012-09-28
+  * Minor Enhancements
+    * Now works with projects that have a top-level coffee-script in node modules.
+== 0.1.1 / 2012-09-28
+  * Minor Enhancements
+    * Made watch more stable on large codebases by being more granular about what is watched.
 == 0.1.0 / 2012-05-28
   * Inaugural Release
-    * DSL for defining tasks, mappings, and command-line switches
-    * Dependency-tracking (mtime database)
-    * Auto-watch w/ smart recalculation
-    * CoffeeScript, LESS, Handlebars copilers
-    * Growl notifications
+    * DSL for defining tasks, mappings, and command-line switches.
+    * Dependency-tracking (mtime database).
+    * Auto-watch w/ smart recalculation.
+    * CoffeeScript, LESS, Handlebars compilers.
+    * Growl notifications.
